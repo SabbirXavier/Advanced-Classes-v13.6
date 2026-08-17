@@ -1,0 +1,1989 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  Wallet, 
+  Settings, 
+  History, 
+  Plus, 
+  TrendingUp, 
+  CreditCard, 
+  ExternalLink, 
+  Trash2, 
+  Edit2, 
+  CheckCircle2, 
+  AlertCircle,
+  FileText,
+  User,
+  Search,
+  ChevronRight,
+  TrendingDown,
+  Upload,
+  ArrowRight,
+  Download,
+  IndianRupee,
+  Users,
+  Clock,
+  Calendar
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import html2canvas from 'html2canvas';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import * as XLSX from 'xlsx';
+import { firestoreService, handleFirestoreError } from '../services/firestoreService';
+import { db } from '../firebase';
+import { collection, query, where, getDocs, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, setDoc, onSnapshot, Timestamp, deleteField } from 'firebase/firestore';
+import toast from 'react-hot-toast';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+import { storageService } from '../services/storageService';
+
+interface SalaryModuleProps {
+  user: any;
+  isAdmin: boolean;
+  isFaculty: boolean;
+  facultyBatches: any[];
+}
+
+export default function SalaryModule({ user, isAdmin, isFaculty, facultyBatches }: SalaryModuleProps) {
+  const [activeTab, setActiveTab] = useState<'overview' | 'settings' | 'payouts' | 'student-payments' | 'admin-earnings'>(isAdmin ? 'settings' : 'overview');
+  const [facultyList, setFacultyList] = useState<any[]>([]);
+  const [facultySalaries, setFacultySalaries] = useState<any[]>([]);
+  const [payouts, setPayouts] = useState<any[]>([]);
+  const [attendance, setAttendance] = useState<any[]>([]);
+  const [enrollments, setEnrollments] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  
+  // Faculty specific state
+  const [mySalaryInfo, setMySalaryInfo] = useState<any>(null);
+  const [isResigning, setIsResigning] = useState(false);
+  const [resignationDate, setResignationDate] = useState('');
+  const [resignationFile, setResignationFile] = useState<File | null>(null);
+  const [resignationFileUploading, setResignationFileUploading] = useState(false);
+  const [resignationFileProgress, setResignationFileProgress] = useState(0);
+  const [isRequestingPayout, setIsRequestingPayout] = useState(false);
+  const [resignations, setResignations] = useState<any[]>([]);
+  const [logFilterDate, setLogFilterDate] = useState('');
+  const [logFilterTime, setLogFilterTime] = useState('');
+  const [logFilterFaculty, setLogFilterFaculty] = useState('');
+  const [payoutAmountFilter, setPayoutAmountFilter] = useState('');
+
+  const filteredPayouts = useMemo(() => {
+    let list = payouts;
+    if (!isAdmin) {
+      list = list.filter(p => p.userId === user.uid);
+    }
+    
+    if (logFilterDate) {
+      list = list.filter(p => p.date?.toDate?.().toLocaleDateString('en-CA') === logFilterDate);
+    }
+    if (logFilterTime) {
+      list = list.filter(p => {
+        const timeParts = p.date?.toDate?.().toTimeString().split(':');
+        if (!timeParts || timeParts.length < 2) return false;
+        return `${timeParts[0]}:${timeParts[1]}` === logFilterTime;
+      });
+    }
+    if (payoutAmountFilter) {
+      list = list.filter(p => p.amount.toString().includes(payoutAmountFilter));
+    }
+    if (isAdmin && logFilterFaculty) {
+      list = list.filter(p => p.userId === logFilterFaculty);
+    }
+    return list;
+  }, [payouts, isAdmin, user.uid, logFilterDate, logFilterTime, payoutAmountFilter, logFilterFaculty]);
+
+  const [isAddingPayout, setIsAddingPayout] = useState(false);
+  const [payoutForm, setPayoutForm] = useState({ userId: '', amount: '', transactionId: '', note: '', method: 'upi', periodMonth: new Date().toISOString().slice(0, 7) });
+  
+  // Faculty Custom Payment Edit & Wrapped
+  const [isEditingPayment, setIsEditingPayment] = useState(false);
+  const [paymentUpi, setPaymentUpi] = useState('');
+  const [paymentBank, setPaymentBank] = useState('');
+  const [showWrapped, setShowWrapped] = useState(false);
+  const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0,7));
+  const [attendanceRecords, setAttendanceRecords] = useState<any[]>([]);
+  const [attendanceModal, setAttendanceModal] = useState<{ open: boolean; facultyId: string; facultyName: string; month: string }>({ open: false, facultyId: '', facultyName: '', month: '' });
+  const [adminAttendanceEdit, setAdminAttendanceEdit] = useState({ totalClassDays: 0, presentDays: 0, absentDays: 0 });
+  const [adminAttendanceEditMode, setAdminAttendanceEditMode] = useState(false);
+  const [isResettingAttendance, setIsResettingAttendance] = useState(false);
+
+  const facultyManagedBatches = useMemo(() => 
+    facultyBatches.filter(fb => fb.userId === user.uid || fb.email === user.email),
+    [facultyBatches, user.uid, user.email]
+  );
+  const monthNames = useMemo(() => [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ], []);
+  const yearOptions = useMemo(() => {
+    const y = new Date().getFullYear();
+    return Array.from({ length: 8 }, (_, i) => y - 5 + i);
+  }, []);
+  const getMonthParts = (value: string) => {
+    const [year, month] = value.split('-');
+    return { year: Number(year), monthIndex: Math.max(0, Number(month || 1) - 1) };
+  };
+  const updateMonthValue = (value: string, year: number, monthIndex: number) => {
+    const next = `${year}-${String(monthIndex + 1).padStart(2, '0')}`;
+    if (value === selectedMonth) setSelectedMonth(next);
+    if (value === studentStatusMonth) setStudentStatusMonth(next);
+  };
+
+  const handleShareWrapped = async () => {
+    const el = document.getElementById('faculty-wrapped-card');
+    if (!el) return;
+    try {
+      toast.loading('Generating your flex card...', { id: 'wrapped' });
+      const canvas = await html2canvas(el, { backgroundColor: '#0f0f13', scale: 2 });
+      const imgData = canvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = imgData;
+      a.download = `Faculty_Wrapped_${user?.displayName || 'Card'}.png`;
+      a.click();
+      toast.success('Downloaded! Share it on WhatsApp \uD83D\uDD25', { id: 'wrapped' });
+    } catch(err) {
+      toast.error('Failed to generate image', { id: 'wrapped' });
+    }
+  };
+
+  const [financeLedgers, setFinanceLedgers] = useState<any[]>([]);
+  const [requests, setRequests] = useState<any[]>([]);
+  const [monthlyFeeLedger, setMonthlyFeeLedger] = useState<any[]>([]);
+  const [studentStatusMonth, setStudentStatusMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [adminSelectedFacultyId, setAdminSelectedFacultyId] = useState('');
+  const [adminSelectedFeeFacultyId, setAdminSelectedFeeFacultyId] = useState('');
+
+  useEffect(() => {
+    let unsubSalaries = () => {};
+    let unsubPayouts = () => {};
+    let unsubAttendance = () => {};
+    let unsubAttendanceRecords = () => {};
+    let unsubEnrollments = () => {};
+    let unsubResignations = () => {};
+    let unsubLedger = () => {};
+    let unsubRequests = () => {};
+    let unsubMonthlyLedger = () => {};
+
+    if (isAdmin) {
+      unsubSalaries = firestoreService.listenToCollection('faculty_salaries', (data) => {
+        setFacultySalaries(data);
+        if (isFaculty) {
+          setMySalaryInfo(data.find(s => s.userId === user.uid));
+        }
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'faculty_salaries');
+      });
+      unsubPayouts = firestoreService.listenToCollection('payouts', (data) => {
+        setPayouts(data.sort((a, b) => (b.date?.seconds || 0) - (a.date?.seconds || 0)));
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'payouts');
+      });
+      unsubAttendance = firestoreService.listenToCollection('faculty_attendance', (data) => {
+        setAttendance(data);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'faculty_attendance');
+      });
+      unsubAttendanceRecords = firestoreService.listenToCollection('attendance_records', (data) => {
+        setAttendanceRecords(data);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'attendance_records');
+      });
+      unsubEnrollments = firestoreService.listenToCollection('enrollments', (data) => {
+        setEnrollments(data);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'enrollments');
+      });
+      unsubResignations = firestoreService.listenToCollection('resignations', (data) => {
+        setResignations(data);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'resignations');
+      });
+      unsubLedger = firestoreService.listenToCollection('finance_ledger', setFinanceLedgers, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'finance_ledger');
+      });
+      unsubRequests = firestoreService.listenToCollection('payout_requests', (data) => {
+        setRequests(data.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'payout_requests');
+      });
+      unsubMonthlyLedger = firestoreService.listenToCollection('student_monthly_fee_ledger', setMonthlyFeeLedger, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'student_monthly_fee_ledger');
+      });
+
+      const fetchFaculty = async () => {
+         try {
+           const [snap1, snap2] = await Promise.all([
+             getDocs(query(collection(db, 'users'), where('roles', 'array-contains', 'faculty'))),
+             getDocs(query(collection(db, 'users'), where('role', '==', 'faculty')))
+           ]);
+           const allUsers = new Map();
+           snap1.docs.forEach(doc => allUsers.set(doc.id, { id: doc.id, ...doc.data() }));
+           snap2.docs.forEach(doc => allUsers.set(doc.id, { id: doc.id, ...doc.data() }));
+           setFacultyList(Array.from(allUsers.values()));
+         } catch (err) {
+           console.error("Error fetching faculty users:", err);
+         }
+         setLoading(false);
+      };
+      fetchFaculty();
+    } else if (isFaculty) {
+      unsubSalaries = onSnapshot(query(collection(db, 'faculty_salaries'), where('userId', '==', user.uid)), (snap) => {
+        const data: any[] = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setFacultySalaries(data);
+        setMySalaryInfo(data.find(s => s.userId === user.uid));
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'faculty_salaries');
+      });
+      unsubPayouts = onSnapshot(query(collection(db, 'payouts'), where('userId', '==', user.uid)), (snap) => {
+        const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setPayouts(data.sort((a: any, b: any) => (b.date?.seconds || 0) - (a.date?.seconds || 0)));
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'payouts');
+      });
+      unsubAttendance = onSnapshot(query(collection(db, 'faculty_attendance'), where('userId', '==', user.uid)), (snap) => {
+        const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setAttendance(data);
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'faculty_attendance');
+      });
+      unsubAttendanceRecords = onSnapshot(query(collection(db, 'attendance_records'), where('facultyId', '==', user.uid)), (snap) => {
+        const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setAttendanceRecords(data);
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'attendance_records');
+      });
+      unsubEnrollments = firestoreService.listenToCollection('enrollments', (data) => {
+        setEnrollments(data);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'enrollments');
+      });
+      unsubResignations = onSnapshot(query(collection(db, 'resignations'), where('userId', '==', user.uid)), (snap) => {
+        const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setResignations(data);
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'resignations');
+      });
+      unsubRequests = onSnapshot(query(collection(db, 'payout_requests'), where('userId', '==', user.uid)), (snap) => {
+        const data = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setRequests(data.sort((a: any, b: any) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
+      }, (err) => {
+        handleFirestoreError(err, OperationType.LIST, 'payout_requests');
+      });
+      unsubMonthlyLedger = firestoreService.listenToCollection('student_monthly_fee_ledger', setMonthlyFeeLedger, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'student_monthly_fee_ledger');
+      });
+      // Ledger might need manual fetching if they own subjects, but right now they fetch none.
+      // Admin will be needed to calculate balances properly, unless ledger read is opened up.
+      // Setting ledger to empty for faculty.
+      setLoading(false);
+    } else {
+      setLoading(false);
+    }
+
+    return () => {
+      unsubSalaries();
+      unsubPayouts();
+      unsubAttendance();
+      unsubAttendanceRecords();
+      unsubEnrollments();
+      unsubResignations();
+      unsubLedger();
+      unsubRequests();
+      unsubMonthlyLedger();
+    };
+  }, [user.uid, isAdmin, isFaculty]);
+
+  const handlePayoutRequest = async () => {
+    if (displayBalance <= 0) {
+      toast.error('Insufficient balance for disbursement');
+      return;
+    }
+    try {
+      await addDoc(collection(db, 'payout_requests'), {
+        userId: user.uid,
+        userName: user.displayName || user.email,
+        amount: displayBalance,
+        status: 'pending',
+        createdAt: serverTimestamp(),
+        type: 'early_disbursement'
+      });
+      setIsRequestingPayout(false);
+      toast.success('Early disbursement request submitted!');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'payout_requests');
+      toast.error('Failed to submit request');
+    }
+  };
+
+  const getFacultyScopedStudents = (facultyId: string, month: string) => {
+    const monthEnd = new Date(`${month}-01`);
+    monthEnd.setMonth(monthEnd.getMonth() + 1);
+    monthEnd.setDate(0);
+    const batches = facultyBatches.filter(fb => fb.userId === facultyId);
+    return enrollments.filter((e) => {
+      if (e.status && e.status !== 'Active') return false;
+      const inAssigned = batches.some((fb) => {
+        const fbGrade = fb.batchName?.match(/XII|XI|X/i)?.[0]?.toUpperCase();
+        const matchesGrade = (fb.batchId && fb.batchId === e.batchId) || (fbGrade && fbGrade === e.grade) || fb.batchName === 'ALL';
+        const matchesSubject = fb.subject === 'ALL' || (e.subjects || []).includes(fb.subject);
+        return matchesGrade && matchesSubject;
+      });
+      if (!inAssigned) return false;
+      const createdAtDate = e.createdAt?.seconds ? new Date(e.createdAt.seconds * 1000) : null;
+      if (!createdAtDate) return true;
+      return createdAtDate.getTime() <= monthEnd.getTime();
+    });
+  };
+
+  const getAttendanceRowsForFacultyMonth = (facultyId: string, month: string) => {
+    if (!facultyId) return [];
+    if (attendanceRecords.length > 0) {
+      return attendanceRecords.filter((r) => {
+        const owner = r.facultyId || r.userId;
+        const dateStr = r.dateStr || (r.date ? String(r.date).slice(0, 10) : '');
+        return owner === facultyId && dateStr.startsWith(month);
+      });
+    }
+    return attendance.filter((r) => r.userId === facultyId && (r.dateStr || '').startsWith(month));
+  };
+
+  const getMonthlySalaryBreakdown = (salaryInfo: any, month: string, manualOverride?: { totalClassDays: number; presentDays: number; absentDays: number }) => {
+    if (!salaryInfo?.userId) {
+      return { presentDays: 0, classDays: 0, absentDays: 0, totalAssignedStudents: 0, paidStudentsCount: 0, unpaidStudentsCount: 0, earnedAmount: 0, pendingPotentialAmount: 0, fullPotentialAmount: 0, realTimeEarnedAmount: 0 };
+    }
+
+    const attendanceRows = getAttendanceRowsForFacultyMonth(salaryInfo.userId, month);
+    const rawPresent = attendanceRows.filter((a: any) => {
+      const status = String(a.status || '').toLowerCase();
+      return a.isApproved || status === 'present' || status === 'late';
+    }).length;
+    const monthlyOverrides = salaryInfo.monthlyAttendanceOverrides?.[month] || {};
+    const presentDays = Number(manualOverride?.presentDays ?? monthlyOverrides.presentDays ?? rawPresent ?? 0);
+    const classDays = Number(manualOverride?.totalClassDays ?? monthlyOverrides.totalClassDays ?? (salaryInfo.totalClassDays || attendanceRows.length || 8)); // default to 8 to avoid NaN
+    const absentDays = Math.max(0, Number(manualOverride?.absentDays ?? monthlyOverrides.absentDays ?? (classDays - presentDays)));
+    
+    // Students calculation
+    const assignedStudents = getFacultyScopedStudents(salaryInfo.userId, month);
+    const assignedIds = new Set(assignedStudents.map((s: any) => s.id));
+    const monthLedger = monthlyFeeLedger.filter((l: any) => l.month === month && assignedIds.has(l.studentId));
+    const paidStudentsCount = monthLedger.filter((l: any) => Number(l.paidAmount || 0) > 0 || l.status === 'Paid').length;
+    const totalAssignedStudents = assignedStudents.length;
+    const unpaidStudentsCount = Math.max(0, totalAssignedStudents - paidStudentsCount);
+
+    const model = salaryInfo.model || 'monthly';
+    const rate = Number(salaryInfo.perStudentRate || salaryInfo.baseAmount || 0);
+
+    let earnedAmount = 0; // The actual "Real-Time Earned" money that depends on everything
+    let fullPotentialAmount = 0; // "Max Possible Salary"
+    
+    if (model === 'monthly') {
+      const totalFixedSalary = rate;
+      const perDaySalary = classDays > 0 ? totalFixedSalary / classDays : 0;
+      earnedAmount = perDaySalary * presentDays;
+      fullPotentialAmount = perDaySalary * classDays; // same as totalFixedSalary
+    } else if (model === 'revenue_percentage') {
+      const sumCollected = monthLedger.reduce((sum: number, l: any) => sum + Number(l.paidAmount || 0), 0);
+      earnedAmount = (sumCollected * rate) / 100;
+      fullPotentialAmount = earnedAmount;
+    } else if (model === 'per_student') {
+      const formulaMode = salaryInfo.perStudentFormulaMode || 'paid_student';
+      const perDayRate = classDays > 0 ? (rate / classDays) : 0;
+      fullPotentialAmount = perDayRate * totalAssignedStudents * classDays;
+
+      if (formulaMode === 'paid_student') {
+         earnedAmount = perDayRate * presentDays * paidStudentsCount;
+      } else {
+        earnedAmount = perDayRate * presentDays * totalAssignedStudents;
+      }
+    }
+
+    return { 
+      presentDays, 
+      classDays, 
+      absentDays, 
+      totalAssignedStudents, 
+      paidStudentsCount, 
+      unpaidStudentsCount, 
+      earnedAmount, 
+      pendingPotentialAmount: Math.max(0, fullPotentialAmount - earnedAmount), 
+      fullPotentialAmount, 
+      realTimeEarnedAmount: earnedAmount // In new logic, realTimeEarnedAmount is just earnedAmount
+    };
+  };
+
+  const calculateNetReceivable = (salaryInfo: any, month: string) => {
+    const breakdown = getMonthlySalaryBreakdown(salaryInfo, month);
+    const monthPayouts = payouts
+      .filter((p) => p.userId === salaryInfo?.userId && (p.periodMonth || month) === month)
+      .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    const monthAdjustments = requests
+      .filter((r) => r.userId === salaryInfo?.userId && r.type === 'salary_adjustment' && r.periodMonth === month)
+      .reduce((sum, r) => sum + Number(r.amount || 0), 0);
+    return Math.max(0, breakdown.earnedAmount + monthAdjustments - monthPayouts);
+  };
+
+  const paidOutTotal = useMemo(
+    () => payouts.filter(p => p.userId === user.uid).reduce((sum, p) => sum + (Number(p.amount) || 0), 0),
+    [payouts, user.uid]
+  );
+  const isPerStudentModel = mySalaryInfo?.model === 'per_student';
+  const estimatedModelReceivable = useMemo(
+    () => calculateNetReceivable(mySalaryInfo, selectedMonth),
+    [mySalaryInfo, attendance, selectedMonth, payouts, monthlyFeeLedger, enrollments, facultyBatches, requests]
+  );
+  const myMonthBreakdown = useMemo(
+    () => getMonthlySalaryBreakdown(mySalaryInfo, selectedMonth),
+    [mySalaryInfo, selectedMonth, attendance, enrollments, monthlyFeeLedger, facultyBatches]
+  );
+  const selectedMonthLabel = useMemo(
+    () => new Date(`${selectedMonth}-01`).toLocaleDateString('en-US', { month: 'long', year: 'numeric' }),
+    [selectedMonth]
+  );
+  const displayBalance = useMemo(() => {
+    return Math.max(0, estimatedModelReceivable);
+  }, [estimatedModelReceivable]);
+
+  useEffect(() => {
+    if (!adminSelectedFacultyId) return;
+    const salaryInfo = facultySalaries.find((s) => s.userId === adminSelectedFacultyId);
+    const breakdown = getMonthlySalaryBreakdown(salaryInfo, selectedMonth);
+    setAdminAttendanceEdit({
+      totalClassDays: breakdown.classDays || 0,
+      presentDays: breakdown.presentDays || 0,
+      absentDays: breakdown.absentDays || 0
+    });
+    setAdminAttendanceEditMode(false);
+  }, [adminSelectedFacultyId, selectedMonth, facultySalaries, attendance, attendanceRecords]);
+
+  const saveSalarySettings = async (facId: string, data: any) => {
+    try {
+      const docId = `salary_${facId}`;
+      await setDoc(doc(db, 'faculty_salaries', docId), {
+        userId: facId,
+        ...data,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+      toast.success('Salary settings updated');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `faculty_salaries/salary_${facId}`);
+      toast.error('Failed to update');
+    }
+  };
+
+  const saveMonthlyAttendanceOverride = async (facId: string, month: string, nextValues: { totalClassDays: number; presentDays: number; absentDays: number }, prevValues: { totalClassDays: number; presentDays: number; absentDays: number }) => {
+    if (!isAdmin) return;
+    try {
+      const docId = `salary_${facId}`;
+      await setDoc(doc(db, 'faculty_salaries', docId), {
+        userId: facId,
+        monthlyAttendanceOverrides: {
+          [month]: nextValues
+        },
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+      await addDoc(collection(db, 'audit_logs'), {
+        action: 'faculty_monthly_attendance_override_updated',
+        facultyId: facId,
+        month,
+        oldValue: prevValues,
+        newValue: nextValues,
+        changedBy: user?.email || user?.uid || 'system',
+        timestamp: serverTimestamp()
+      });
+      toast.success('Attendance summary updated');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `faculty_salaries/salary_${facId}`);
+      toast.error('Failed to update attendance summary');
+    }
+  };
+
+  const resetMonthlyAttendanceOverride = async (facId: string, month: string) => {
+    if (!isAdmin) return;
+    setIsResettingAttendance(true);
+    try {
+      const docId = `salary_${facId}`;
+      await updateDoc(doc(db, 'faculty_salaries', docId), {
+        [`monthlyAttendanceOverrides.${month}`]: deleteField(),
+        updatedAt: serverTimestamp()
+      });
+      await addDoc(collection(db, 'audit_logs'), {
+        action: 'faculty_monthly_attendance_override_reset',
+        facultyId: facId,
+        month,
+        changedBy: user?.email || user?.uid || 'system',
+        timestamp: serverTimestamp()
+      });
+      setAdminAttendanceEditMode(false);
+      toast.success('Reset to automatic attendance values');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `faculty_salaries/salary_${facId}`);
+      toast.error('Failed to reset override');
+    } finally {
+      setIsResettingAttendance(false);
+    }
+  };
+
+  const normalizeAttendanceRow = (r: any) => {
+    const dateVal = r.dateStr || r.date || r.classDate || '-';
+    const batchVal = r.batchName || r.className || r.batch || r.batchId || '-';
+    const markedByVal = r.markedBy || r.markedByName || r.updatedBy || r.userName || r.teacherName || '-';
+    const ts = r.markedAt?.toDate?.()
+      || r.timestamp?.toDate?.()
+      || r.createdAt?.toDate?.()
+      || r.updatedAt?.toDate?.()
+      || null;
+    const timeOnly = typeof r.timeMarkedAt === 'string'
+      ? r.timeMarkedAt
+      : (r.timeMarkedAt?.toDate?.() ? r.timeMarkedAt.toDate().toLocaleTimeString() : '');
+    const finalTimestamp = ts
+      ? ts.toLocaleString()
+      : (timeOnly ? `${dateVal} ${timeOnly}` : '-');
+    return {
+      date: dateVal,
+      subject: r.subject || r.subjectName || '-',
+      batch: batchVal,
+      status: r.status || (r.isApproved ? 'Present' : 'Absent'),
+      markedBy: markedByVal,
+      timestamp: finalTimestamp
+    };
+  };
+
+  const exportAttendanceXlsx = (rows: any[], facultyName: string, month: string) => {
+    const exportRows = rows.map((r: any) => {
+      const n = normalizeAttendanceRow(r);
+      return {
+        Date: n.date,
+        Subject: n.subject,
+        Batch: n.batch,
+        Status: n.status,
+        MarkedBy: n.markedBy,
+        Timestamp: n.timestamp
+      };
+    });
+    const ws = XLSX.utils.json_to_sheet(exportRows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Attendance');
+    XLSX.writeFile(wb, `${facultyName.replace(/\s+/g, '_')}_${month}_attendance.xlsx`);
+  };
+
+  const exportAttendancePdf = (rows: any[], facultyName: string, month: string) => {
+    const pdf = new jsPDF({ orientation: 'landscape' });
+    pdf.setFontSize(12);
+    pdf.text(`Attendance Report - ${facultyName} (${month})`, 14, 12);
+    autoTable(pdf, {
+      startY: 18,
+      head: [['Date', 'Subject', 'Batch', 'Status', 'Marked By', 'Timestamp']],
+      body: rows.map((r: any) => {
+        const n = normalizeAttendanceRow(r);
+        return [n.date, n.subject, n.batch, n.status, n.markedBy, n.timestamp];
+      })
+    });
+    pdf.save(`${facultyName.replace(/\s+/g, '_')}_${month}_attendance.pdf`);
+  };
+
+  const recordPayout = async (data: any) => {
+    try {
+      const payoutId = `TXN-${Date.now()}`;
+      await addDoc(collection(db, 'payouts'), {
+        ...data,
+        method: data.method || 'upi',
+        periodMonth: data.periodMonth || selectedMonth,
+        approvedBy: data.approvedBy || user.email || 'system',
+        approvedAt: serverTimestamp(),
+        date: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        transactionId: data.transactionId || payoutId
+      });
+      // Also sync it with finances
+      await addDoc(collection(db, 'finances'), {
+        type: 'expense',
+        category: 'Teacher Salary',
+        amount: Number(data.amount),
+        title: `Salary Payout: ${data.userName}`,
+        date: serverTimestamp(),
+        createdAt: serverTimestamp(),
+        notes: `Payout for month: ${data.periodMonth || selectedMonth}`,
+        studentId: data.userId, // Storing faculty ID here for linking 
+        studentName: data.userName,
+        transactionId: data.transactionId || payoutId
+      });
+      toast.success('Payout record saved & Finance ledger updated');
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'payouts');
+      toast.error('Failed to save payout');
+    }
+  };
+
+  const [isResignationSubmitted, setIsResignationSubmitted] = useState(false);
+
+  const handleResignation = async () => {
+    if (!resignationDate) {
+        toast.error('Please select a resignation date');
+        return;
+    }
+    if (!resignationFile) {
+        toast.error('Please upload your resignation letter');
+        return;
+    }
+    
+    setResignationFileUploading(true);
+    setResignationFileProgress(0);
+    const toastId = toast.loading('Uploading resignation letter...');
+    try {
+      const { promise } = storageService.uploadFile(resignationFile, (progress) => {
+          setResignationFileProgress(progress);
+      });
+      const uploadedFile = await promise;
+
+      toast.loading('Saving resignation record...', { id: toastId });
+      await addDoc(collection(db, 'resignations'), {
+        userId: user.uid,
+        userName: user.displayName || user.email,
+        email: user.email,
+        resignationDate,
+        letterUrl: uploadedFile.url,
+        letterName: resignationFile.name,
+        submittedAt: serverTimestamp(),
+        status: 'pending'
+      });
+      setIsResignationSubmitted(true);
+      toast.success('Resignation successfully submitted.', { id: toastId });
+      
+      setTimeout(() => {
+        setIsResigning(false);
+        setIsResignationSubmitted(false);
+        setResignationFile(null);
+      }, 3000);
+      
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'resignations');
+      toast.error('Failed to submit: ' + (err as any).message, { id: toastId });
+    } finally {
+      setResignationFileUploading(false);
+    }
+  };
+
+  const attendanceModalRows = attendanceModal.open
+    ? getAttendanceRowsForFacultyMonth(attendanceModal.facultyId, attendanceModal.month)
+    : [];
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="bg-gradient-to-r from-emerald-600 to-emerald-900 p-8 rounded-3xl text-white shadow-xl relative overflow-hidden">
+        <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+          <div>
+            <h2 className="text-3xl font-black mb-2 flex items-center gap-2">
+              <Wallet className="text-emerald-300" size={32} />
+              FACULTY & PAYROLL
+            </h2>
+            <p className="text-emerald-100 opacity-80 font-medium tracking-wide">Salary management and payment tracking</p>
+          </div>
+        </div>
+        <Wallet className="absolute -right-8 -bottom-8 w-64 h-64 text-white/5 rotate-12" />
+      </div>
+        
+        <div className="flex flex-wrap gap-2 p-1 bg-white/5 rounded-2xl border border-white/5">
+          {isFaculty && (
+            <button 
+              onClick={() => setActiveTab('overview')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'overview' ? 'bg-[var(--primary)] text-white' : 'text-gray-500 hover:text-white'}`}
+            >
+              My Earnings
+            </button>
+          )}
+          {isAdmin && (
+            <button 
+              onClick={() => setActiveTab('settings' as any)}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'settings' ? 'bg-[var(--primary)] text-white' : 'text-gray-500 hover:text-white'}`}
+            >
+              Faculty Settings
+            </button>
+          )}
+          {isAdmin && (
+            <button 
+              onClick={() => setActiveTab('requests' as any)}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === ('requests' as any) ? 'bg-[var(--primary)] text-white' : 'text-gray-500 hover:text-white'}`}
+            >
+              Requests
+              {resignations.length > 0 && <span className="ml-2 px-1.5 py-0.5 bg-red-500 text-white rounded text-[10px]">{resignations.length}</span>}
+            </button>
+          )}
+          <button 
+            onClick={() => setActiveTab('payouts')}
+            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'payouts' ? 'bg-[var(--primary)] text-white' : 'text-gray-500 hover:text-white'}`}
+          >
+            Payout History
+          </button>
+          {(isFaculty || isAdmin) && (
+            <button 
+              onClick={() => setActiveTab('student-payments')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'student-payments' ? 'bg-[var(--primary)] text-white' : 'text-gray-500 hover:text-white'}`}
+            >
+              {isAdmin ? "Student Fee Status" : "My Student's Fee Status"}
+            </button>
+          )}
+          {isAdmin && (
+            <button
+              onClick={() => setActiveTab('admin-earnings')}
+              className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'admin-earnings' ? 'bg-[var(--primary)] text-white' : 'text-gray-500 hover:text-white'}`}
+            >
+              Earnings Monitor
+            </button>
+          )}
+        </div>
+
+      <AnimatePresence mode="wait">
+        {activeTab === 'overview' && isFaculty && (
+          <motion.div key="overview" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
+            
+            {(() => {
+              const salaryPaid = payouts
+                .filter((p) => p.userId === user.uid && (p.periodMonth || selectedMonth) === selectedMonth)
+                .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+              return (
+              <div className="space-y-6">
+                <div className="glass-card p-6 bg-indigo-500/10 border-indigo-500/20 max-w-3xl relative overflow-hidden">
+                    <div className="flex justify-between items-start relative z-10">
+                         <div>
+                            <div className="flex items-center gap-2 text-xs uppercase font-black opacity-80 mb-1 tracking-widest text-indigo-400">
+                               <TrendingUp size={16} /> Max Potential
+                            </div>
+                            <div className="text-5xl font-black text-green-400 flex items-baseline gap-1 mt-2">
+                              ₹{Math.round(myMonthBreakdown.fullPotentialAmount).toLocaleString()}
+                            </div>
+                            <div className="text-xs opacity-60 mt-2 font-bold uppercase tracking-widest text-indigo-400">Total possible earnings this month</div>
+                         </div>
+                    </div>
+                    
+                    <div className="absolute top-4 right-4 text-indigo-500/20 z-0">
+                        <TrendingUp size={100} strokeWidth={1.5} />
+                    </div>
+                    
+                    <div className="mt-8 grid grid-cols-2 gap-4 bg-black/20 rounded-2xl p-4 border border-white/5 relative z-10">
+                        <div>
+                            <div className="flex items-center gap-2 mb-1">
+                                 <div className="w-2 h-2 rounded-full bg-green-500"></div>
+                                 <span className="text-xs font-bold text-white leading-tight">Real-Time Earned</span>
+                            </div>
+                            <div className="text-2xl font-black text-green-400">₹{Math.round(myMonthBreakdown.realTimeEarnedAmount).toLocaleString()}</div>
+                            <div className="text-[10px] text-gray-400 mt-1 leading-tight">From paid students &<br/>attendance</div>
+                        </div>
+                        <div>
+                            <div className="flex items-center gap-2 mb-1">
+                                 <div className="w-2 h-2 rounded-full bg-amber-500"></div>
+                                 <span className="text-xs font-bold text-white leading-tight">Salary Paid</span>
+                            </div>
+                            <div className="text-2xl font-black text-amber-400">₹{Math.round(salaryPaid).toLocaleString()}</div>
+                            <div className="text-[10px] text-gray-400 mt-1 leading-tight">Total amount<br/>disbursed</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="glass-card p-6 bg-white/5 border-white/10 mt-4 flex items-center justify-between max-w-3xl relative overflow-hidden">
+                    <div className="relative z-10">
+                        <div className="flex items-center gap-2 text-xs uppercase font-black opacity-60 mb-1 tracking-widest text-indigo-400">
+                            <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center"><IndianRupee size={12} className="text-indigo-400" /></div>
+                            Balance Salary
+                        </div>
+                        <div className="text-3xl font-black text-indigo-400 mt-2">
+                            ₹{Math.round(displayBalance).toLocaleString()}
+                        </div>
+                        <div className="text-xs opacity-50 mt-1 uppercase tracking-widest font-bold">Real-Time Earned - Salary Paid</div>
+                    </div>
+                    <div className="absolute right-6 top-1/2 -translate-y-1/2 text-white/5">
+                       <div className="w-16 h-16 rounded-3xl bg-indigo-500/10 flex items-center justify-center rotate-12">
+                           <IndianRupee size={32} />
+                       </div>
+                    </div>
+                </div>
+
+                <div className="glass-card p-6 bg-white/5 border-white/10 mt-4 max-w-3xl">
+                    <div className="text-xs uppercase font-black opacity-60 mb-6 tracking-widest">Your Earning Progress</div>
+                    
+                    <div className="flex items-center justify-between mb-2">
+                        <div>
+                           <div className="text-[10px] text-gray-400 font-bold mb-1">Max Potential</div>
+                           <div className="text-xl md:text-2xl font-black text-purple-400">₹{Math.round(myMonthBreakdown.fullPotentialAmount).toLocaleString()}</div>
+                           <div className="text-[10px] text-gray-500 mt-1 leading-tight hidden md:block">If all students pay &<br/>full attendance</div>
+                        </div>
+                        <div className="flex flex-col items-center mx-1 md:mx-2">
+                           <div className="w-14 h-14 md:w-16 md:h-16 rounded-full border-4 border-indigo-500/20 flex items-center justify-center relative shadow-[0_0_15px_rgba(99,102,241,0.2)] bg-[#1e1e1e]">
+                                <span className="text-xs md:text-sm font-black">{Math.round((myMonthBreakdown.realTimeEarnedAmount / Math.max(1, myMonthBreakdown.fullPotentialAmount)) * 100)}%</span>
+                           </div>
+                           <div className="text-[10px] text-gray-400 mt-2 text-center leading-tight">Progress to<br/>Max Potential</div>
+                        </div>
+                        <div className="text-right">
+                           <div className="text-[10px] text-gray-400 font-bold mb-1">Unlockable</div>
+                           <div className="text-xl md:text-2xl font-black text-amber-400">₹{Math.round(myMonthBreakdown.pendingPotentialAmount).toLocaleString()}</div>
+                           <div className="text-[10px] text-gray-500 mt-1 leading-tight hidden md:block">Keep going! You can<br/>still earn more</div>
+                        </div>
+                    </div>
+                    
+                    <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden mt-6 relative">
+                         <motion.div initial={{ width: 0 }} animate={{ width: `${Math.round((myMonthBreakdown.realTimeEarnedAmount / Math.max(1, myMonthBreakdown.fullPotentialAmount)) * 100)}%` }} className="absolute top-0 bottom-0 left-0 bg-indigo-500 rounded-full"></motion.div>
+                    </div>
+                    <div className="text-[10px] text-indigo-400 mt-2 font-bold tracking-widest uppercase">₹{Math.round(myMonthBreakdown.realTimeEarnedAmount).toLocaleString()} earned of ₹{Math.round(myMonthBreakdown.fullPotentialAmount).toLocaleString()} max potential</div>
+                </div>
+
+                <div className="glass-card p-6 bg-white/5 border-white/10 mt-4 max-w-3xl">
+                    <div className="flex items-center gap-2 text-xs uppercase font-black opacity-60 mb-4 tracking-widest">
+                         <Users size={16} /> Student Fee Summary
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                         <div className="bg-black/20 rounded-xl p-4 flex flex-col md:flex-row md:items-center gap-3 border border-green-500/20">
+                             <div className="w-10 h-10 rounded-full bg-green-500/20 flex items-center justify-center text-green-500 shrink-0"><CheckCircle2 size={20} /></div>
+                             <div>
+                                 <div className="text-[10px] text-gray-400 font-bold leading-tight uppercase">Paid<br/>({selectedMonthLabel})</div>
+                                 <div className="text-xl font-black text-green-400 mt-1">{myMonthBreakdown.paidStudentsCount} <span className="text-xs font-normal opacity-50 text-white">students</span></div>
+                             </div>
+                         </div>
+                         <div className="bg-black/20 rounded-xl p-4 flex flex-col md:flex-row md:items-center gap-3 border border-amber-500/20">
+                             <div className="w-10 h-10 rounded-full bg-amber-500/20 flex items-center justify-center text-amber-500 shrink-0"><Clock size={20} /></div>
+                             <div>
+                                 <div className="text-[10px] text-gray-400 font-bold leading-tight uppercase">Pending<br/>({selectedMonthLabel})</div>
+                                 <div className="text-xl font-black text-amber-400 mt-1">{myMonthBreakdown.unpaidStudentsCount} <span className="text-xs font-normal opacity-50 text-white">students</span></div>
+                             </div>
+                         </div>
+                    </div>
+                </div>
+
+                <div className="glass-card p-6 bg-white/5 border-white/10 mt-4 max-w-3xl relative overflow-hidden">
+                    <div className="flex items-center justify-between mb-4">
+                        <div className="flex items-center gap-2 text-xs uppercase font-black opacity-60 tracking-widest">
+                             <Calendar size={16} /> Attendance Impact
+                        </div>
+                        <button
+                            onClick={() => setAttendanceModal({ open: true, facultyId: user.uid, facultyName: user.displayName || user.email || 'Faculty', month: selectedMonth })}
+                            className="text-[10px] text-indigo-400 uppercase font-bold px-2 py-1 bg-indigo-500/10 rounded hover:bg-indigo-500/20 transition-colors"
+                        >
+                             View Log
+                        </button>
+                    </div>
+                    
+                    <div className="flex items-end justify-between font-bold mb-2">
+                        <div className="text-xs opacity-80">Present Days <span className="text-green-400 font-black ml-2 text-xl md:text-2xl">{myMonthBreakdown.presentDays} <span className="text-gray-500 text-sm">/ {myMonthBreakdown.classDays}</span></span></div>
+                        <div className="text-green-400 text-sm md:text-base">{Math.round((myMonthBreakdown.presentDays / Math.max(1, myMonthBreakdown.classDays)) * 100)}%</div>
+                    </div>
+                    
+                    <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden mt-2 relative">
+                         <motion.div initial={{ width: 0 }} animate={{ width: `${Math.round((myMonthBreakdown.presentDays / Math.max(1, myMonthBreakdown.classDays)) * 100)}%` }} className="absolute top-0 bottom-0 left-0 bg-green-500 rounded-full"></motion.div>
+                    </div>
+                    <div className="text-[10px] text-gray-400 mt-2 flex justify-between items-center">
+                        <span className="font-bold uppercase tracking-widest">Attendance Efficiency</span>
+                    </div>
+                </div>
+              </div>
+              );
+            })()}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-3xl mt-4">
+              <div className="glass-card p-6 flex flex-col justify-between relative overflow-hidden">
+                <div className="relative z-10">
+                   <div className="text-[10px] uppercase font-black opacity-40 mb-3 flex items-center justify-between">
+                     Payout Method
+                     <button onClick={() => {
+                        setPaymentUpi(mySalaryInfo?.paymentMethod?.upiId || '');
+                        setPaymentBank(mySalaryInfo?.paymentMethod?.bankDetails || '');
+                        setIsEditingPayment(true);
+                     }} className="text-indigo-500 hover:scale-110 transition-transform"><Edit2 size={12} /></button>
+                   </div>
+                   <div className="text-sm font-bold flex flex-col gap-3">
+                     <div className="flex items-center gap-3 bg-white/5 p-2 rounded-xl"><CreditCard size={14} className="text-indigo-500" /> UPI: <span className="opacity-80 font-medium">{mySalaryInfo?.paymentMethod?.upiId || 'Not Set'}</span></div>
+                     <div className="flex items-center gap-3 bg-white/5 p-2 rounded-xl text-xs"><Wallet size={14} className="opacity-70" /> {mySalaryInfo?.paymentMethod?.bankDetails?.substring(0, 20) || 'Bank Not Set'}...</div>
+                   </div>
+                </div>
+                <button 
+                  disabled={displayBalance <= 0}
+                  onClick={() => setIsRequestingPayout(true)}
+                  className={`mt-4 py-3 relative z-10 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${
+                    displayBalance > 0 
+                    ? 'bg-indigo-500 text-white hover:scale-105 shadow-xl hover:shadow-indigo-500/20' 
+                    : 'bg-white/5 text-gray-500 cursor-not-allowed'
+                  }`}
+                >
+                  Request Early Disbursement
+                </button>
+              </div>
+
+              <div className="glass-card p-6 flex flex-col justify-between relative overflow-hidden">
+                 <div className="relative z-10">
+                    <div className="text-[10px] uppercase font-black opacity-40 mb-3">Current Status</div>
+                    <div className="text-sm font-bold text-green-500 flex items-center gap-2 bg-green-500/10 p-2 rounded-xl">
+                      <CheckCircle2 size={16} /> Active Employee
+                    </div>
+                 </div>
+                 <div className="flex flex-col gap-2 mt-4 relative z-10">
+                   <button 
+                    onClick={() => setShowWrapped(true)}
+                    className="w-full py-3 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:scale-[1.02] transition-transform flex justify-center items-center gap-2 shadow-lg"
+                   >
+                     <span>Generate Flex Card</span>
+                   </button>
+                   <button 
+                    onClick={() => setIsResigning(true)}
+                    className="w-full py-2 bg-white/5 text-red-500 border border-red-500/20 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-red-500/10 transition-all flex justify-center items-center"
+                   >
+                     Resign
+                   </button>
+                 </div>
+              </div>
+            </div>
+
+            <AnimatePresence>
+              {isRequestingPayout && (
+                <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4">
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setIsRequestingPayout(false)} />
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="relative w-full max-w-md bg-[#1e1e1e] rounded-3xl p-8 space-y-6">
+                    <h3 className="text-xl font-black italic">REQUEST DISBURSEMENT</h3>
+                    <div className="p-4 bg-indigo-500/10 rounded-2xl border border-indigo-500/20">
+                      <div className="text-[10px] font-black uppercase opacity-40 mb-1">Disbursable Amount</div>
+                      <div className="text-3xl font-black text-indigo-500">₹{Math.round(displayBalance).toLocaleString()}</div>
+                      <p className="text-[10px] opacity-60 mt-2">This request will be processed within 24-48 hours after admin review.</p>
+                    </div>
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between text-xs font-bold">
+                        <span className="opacity-60">Admin Processing Fee:</span>
+                        <span>₹0 (Helium Wave)</span>
+                      </div>
+                      <div className="flex items-center justify-between text-base font-black border-t border-white/10 pt-4">
+                        <span>Net Payout:</span>
+                        <span className="text-indigo-400">₹{Math.round(displayBalance).toLocaleString()}</span>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={handlePayoutRequest}
+                      className="w-full py-4 bg-indigo-500 text-white rounded-2xl font-black uppercase tracking-widest hover:scale-[1.02] transition-transform shadow-xl"
+                    >
+                      Process Instant Request
+                    </button>
+                  </motion.div>
+                </div>
+              )}
+            </AnimatePresence>
+
+            <div className="glass-card overflow-hidden">
+               <div className="p-4 border-b border-white/5 bg-white/5 font-bold italic">MY PAYOUT LOGS</div>
+               <div className="overflow-x-auto">
+                 <table className="w-full text-left">
+                   <thead className="bg-white/5 text-[10px] font-black uppercase opacity-40">
+                     <tr>
+                       <th className="p-4">Date</th>
+                       <th className="p-4">Amount</th>
+                       <th className="p-4">Transaction ID</th>
+                       <th className="p-4">Note</th>
+                       <th className="p-4">Receipt</th>
+                     </tr>
+                   </thead>
+                   <tbody className="divide-y divide-white/5 text-xs">
+                     {payouts.filter(p => p.userId === user.uid).map(p => (
+                       <tr key={p.id}>
+                         <td className="p-4 font-bold">{p.date?.toDate().toLocaleDateString()}</td>
+                         <td className="p-4 font-black">₹{p.amount.toLocaleString()}</td>
+                         <td className="p-4 font-mono opacity-60">{p.transactionId || '---'}</td>
+                         <td className="p-4 italic opacity-60">{p.note || 'Regular Payout'}</td>
+                         <td className="p-4">
+                           {p.receiptUrl && <a href={p.receiptUrl} target="_blank" className="text-[var(--primary)] hover:underline">View</a>}
+                         </td>
+                       </tr>
+                     ))}
+                   </tbody>
+                 </table>
+               </div>
+            </div>
+          </motion.div>
+        )}
+
+        {activeTab === 'settings' && isAdmin && (
+          <motion.div key="settings" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
+            <div className="grid grid-cols-1 gap-4">
+              {facultyList.map(faculty => {
+                const salary = facultySalaries.find(s => s.userId === faculty.id);
+                const selectedModel = salary?.model || 'monthly';
+                const showPerStudentFields = selectedModel === 'per_student';
+                return (
+                  <div key={faculty.id} className="glass-card p-6 flex flex-col md:flex-row gap-6 border-l-4 border-[var(--primary)]">
+                    <div className="flex-1 space-y-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-12 h-12 rounded-full bg-[var(--primary)]/10 text-[var(--primary)] flex items-center justify-center font-bold">
+                          {faculty.name?.charAt(0)}
+                        </div>
+                        <div>
+                          <h4 className="font-bold">{faculty.name}</h4>
+                          <p className="text-[10px] opacity-40">{faculty.email}</p>
+                        </div>
+                      </div>
+                      
+                      <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+                         <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase opacity-40 pl-1">Rate Type</label>
+                            <select 
+                              value={selectedModel}
+                              onChange={(e) => saveSalarySettings(faculty.id, { model: e.target.value })}
+                              className="w-full p-2 bg-white/5 border border-white/10 rounded-lg text-xs font-bold"
+                            >
+                              <option value="monthly">Fixed Monthly Salary</option>
+                              <option value="per_student">Fixed Per Student Rate</option>
+                              <option value="revenue_percentage">Percentage of Revenue (%)</option>
+                            </select>
+                         </div>
+                         
+                         {selectedModel === 'monthly' && (
+                         <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase opacity-40 pl-1">Base Amount (₹)</label>
+                            <input 
+                              type="number"
+                              value={salary?.baseAmount || ''}
+                              onChange={(e) => saveSalarySettings(faculty.id, { baseAmount: e.target.value })}
+                              className="w-full p-2 bg-white/5 border border-white/10 rounded-lg text-xs font-bold"
+                            />
+                         </div>
+                         )}
+
+                         {selectedModel === 'per_student' && (
+                         <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase opacity-40 pl-1">Per Student Rate (₹)</label>
+                            <input 
+                              type="number"
+                              value={salary?.perStudentRate || salary?.baseAmount || ''}
+                              onChange={(e) => saveSalarySettings(faculty.id, { perStudentRate: e.target.value })}
+                              className="w-full p-2 bg-white/5 border border-white/10 rounded-lg text-xs font-bold"
+                            />
+                         </div>
+                         )}
+
+                         {selectedModel === 'revenue_percentage' && (
+                         <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase opacity-40 pl-1">Percentage (%)</label>
+                            <input 
+                              type="number"
+                              value={salary?.perStudentRate || salary?.baseAmount || ''}
+                              onChange={(e) => saveSalarySettings(faculty.id, { perStudentRate: e.target.value })}
+                              className="w-full p-2 bg-white/5 border border-white/10 rounded-lg text-xs font-bold"
+                            />
+                         </div>
+                         )}
+
+                         {selectedModel !== 'revenue_percentage' && (
+                         <div className="space-y-1">
+                            <label className="text-[8px] font-black uppercase opacity-40 pl-1">Class Days / Month</label>
+                            <input
+                              type="number"
+                              value={salary?.totalClassDays || ''}
+                              onChange={(e) => saveSalarySettings(faculty.id, { totalClassDays: e.target.value })}
+                              className="w-full p-2 bg-white/5 border border-white/10 rounded-lg text-xs font-bold"
+                            />
+                         </div>
+                         )}
+
+                         {selectedModel === 'per_student' && (
+                            <div className="space-y-1">
+                               <label className="text-[8px] font-black uppercase opacity-40 pl-1">Calculation Base</label>
+                               <select
+                                 value={salary?.perStudentFormulaMode || 'paid_student'}
+                                 onChange={(e) => saveSalarySettings(faculty.id, { perStudentFormulaMode: e.target.value })}
+                                 className="w-full p-2 bg-white/5 border border-white/10 rounded-lg text-xs font-bold"
+                               >
+                                 <option value="attendance_adjusted">All Assigned Students</option>
+                                 <option value="paid_student">Only Paid Students</option>
+                               </select>
+                            </div>
+                         )}
+                         <div className="flex items-end">
+                            <button 
+                              onClick={() => {
+                                const amount = calculateNetReceivable(salary, selectedMonth);
+                                const confirm = window.confirm(`Generate payout of ₹${Math.round(amount)} for ${faculty.name}?`);
+                                if (confirm) {
+                                  recordPayout({
+                                    userId: faculty.id,
+                                    userName: faculty.name,
+                                    amount: Math.round(amount),
+                                    periodMonth: selectedMonth,
+                                    method: 'manual',
+                                    approvedBy: user.email,
+                                    note: `Auto-generated monthly payout`,
+                                    transactionId: `TXN-${Date.now()}`
+                                  });
+                                }
+                              }}
+                              className="w-full p-2 bg-[var(--primary)] text-white rounded-lg text-[10px] font-black uppercase"
+                            >
+                              Process Payout
+                            </button>
+                         </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+
+        {activeTab === 'payouts' && (
+           <motion.div key="payouts" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="glass-card overflow-hidden">
+             <div className="p-4 border-b border-white/5 bg-white/5 flex flex-col md:flex-row justify-between gap-4 items-start md:items-center">
+               <span className="font-bold italic">ALL TRANSACTION LOGS</span>
+               <div className="flex flex-wrap items-center gap-2">
+                 {isAdmin && (
+                   <select 
+                     value={logFilterFaculty} 
+                     onChange={(e) => setLogFilterFaculty(e.target.value)}
+                     className="px-3 py-1 bg-white/5 border border-white/10 rounded-lg text-xs"
+                   >
+                     <option value="" className="text-black">All Faculties</option>
+                     {facultyList.map(f => (
+                       <option key={f.id} value={f.id} className="text-black">{f.name || f.email}</option>
+                     ))}
+                   </select>
+                 )}
+                 <input 
+                   type="date" 
+                   value={logFilterDate} 
+                   onChange={(e) => setLogFilterDate(e.target.value)} 
+                   className="px-3 py-1 bg-white/5 border border-white/10 rounded-lg text-xs color-scheme-dark"
+                   placeholder="Filter by Date"
+                 />
+                 <input 
+                   type="time" 
+                   value={logFilterTime} 
+                   onChange={(e) => setLogFilterTime(e.target.value)} 
+                   className="px-3 py-1 bg-white/5 border border-white/10 rounded-lg text-xs color-scheme-dark"
+                   placeholder="Filter by Time"
+                 />
+                 <input 
+                   type="text" 
+                   value={payoutAmountFilter} 
+                   onChange={(e) => setPayoutAmountFilter(e.target.value)} 
+                   className="px-3 py-1 bg-white/5 border border-white/10 rounded-lg text-xs w-24 placeholder-white/40"
+                   placeholder="Amount..."
+                 />
+                 {isAdmin && (
+                   <button onClick={() => setIsAddingPayout(true)} className="p-2 bg-[var(--primary)] text-white rounded-lg hover:opacity-80 transition-opacity"><Plus size={16} /></button>
+                 )}
+               </div>
+             </div>
+             <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead className="bg-white/5 text-[10px] font-black uppercase opacity-40">
+                    <tr>
+                      <th className="p-4">Faculty</th>
+                      <th className="p-4">Date</th>
+                      <th className="p-4">Amount</th>
+                      <th className="p-4">Transaction ID</th>
+                      <th className="p-4 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/5 text-xs">
+                    {filteredPayouts.map(p => (
+                      <tr key={p.id} className="hover:bg-white/5">
+                        <td className="p-4">
+                          <div className="font-bold">{p.userName}</div>
+                          <div className="text-[8px] opacity-40 uppercase">Payout</div>
+                        </td>
+                        <td className="p-4">{p.date?.toDate().toLocaleDateString()}</td>
+                        <td className="p-4 font-black">₹{p.amount.toLocaleString()}</td>
+                        <td className="p-4 font-mono opacity-60">{p.transactionId}</td>
+                        <td className="p-4 text-right">
+                          {isAdmin && (
+                            <div className="flex justify-end gap-2">
+                              <button onClick={() => firestoreService.deleteItem('payouts', p.id)} className="p-1.5 text-red-500 hover:bg-red-500/10 rounded"><Trash2 size={14}/></button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+             </div>
+           </motion.div>
+        )}
+
+        {activeTab === 'student-payments' && (isFaculty || isAdmin) && (
+          <motion.div key="students" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-4">
+            <div className="flex flex-col md:flex-row justify-between md:items-center mb-4 gap-4">
+               <div>
+                  <h3 className="font-bold">{isAdmin ? "Student Fee Status" : "My Student's Fee Status"}</h3>
+                  <p className="text-xs opacity-60">Monthly reporting section to monitor paid / unpaid students in assigned batches.</p>
+               </div>
+               <div className="flex flex-wrap gap-2">
+                 {isAdmin && (
+                   <select
+                     value={adminSelectedFeeFacultyId}
+                     onChange={(e) => setAdminSelectedFeeFacultyId(e.target.value)}
+                     className="px-3 py-2 rounded-xl text-xs font-bold bg-white/5 border border-white/10 text-white"
+                   >
+                     <option value="" className="text-black">All Institute</option>
+                     {facultyList.map(f => <option key={f.id} value={f.id} className="text-black">{f.name || f.email}</option>)}
+                   </select>
+                 )}
+                 <select
+                   value={getMonthParts(studentStatusMonth).year}
+                   onChange={(e) => updateMonthValue(studentStatusMonth, Number(e.target.value), getMonthParts(studentStatusMonth).monthIndex)}
+                   className="px-3 py-2 rounded-xl text-xs font-bold bg-white/5 border border-white/10"
+                 >
+                   {yearOptions.map((y) => <option key={y} value={y}>{y}</option>)}
+                 </select>
+                 <select
+                   value={getMonthParts(studentStatusMonth).monthIndex}
+                   onChange={(e) => updateMonthValue(studentStatusMonth, getMonthParts(studentStatusMonth).year, Number(e.target.value))}
+                   className="px-3 py-2 rounded-xl text-xs font-bold bg-white/5 border border-white/10"
+                 >
+                   {monthNames.map((name, idx) => <option key={name} value={idx}>{name}</option>)}
+                 </select>
+               </div>
+            </div>
+            {(() => {
+              const activeFacultyId = isAdmin ? adminSelectedFeeFacultyId : user.uid;
+              
+              // If admin and no faculty selected, show All Institute mode
+              let scopedBatches: any[] = [];
+              let scopedStudents: any[] = [];
+
+              if (isAdmin && !adminSelectedFeeFacultyId) {
+                // All Institute mode: Show all active students
+                scopedStudents = enrollments.filter(e => !e.status || e.status === 'Active');
+              } else {
+                if (!activeFacultyId) {
+                  return <div className="p-10 text-center opacity-40 italic">Please select a faculty to view their student fee status.</div>;
+                }
+                scopedBatches = facultyBatches.filter(fb => fb.userId === activeFacultyId);
+              
+                scopedStudents = enrollments.filter((e) => {
+                  if (e.status && e.status !== 'Active') return false;
+                  return scopedBatches.some((fb) => {
+                    const fbGrade = fb.batchName?.match(/XII|XI|X/i)?.[0]?.toUpperCase();
+                    const matchesGrade = (fb.batchId && fb.batchId === e.batchId) || (fbGrade && fbGrade === e.grade) || fb.batchName === 'ALL';
+                    const matchesSubject = fb.subject === 'ALL' || (e.subjects || []).includes(fb.subject);
+                    return matchesGrade && matchesSubject;
+                  });
+                });
+              }
+              const scopedIds = new Set(scopedStudents.map((s) => s.id));
+              const scopedLedger = monthlyFeeLedger.filter((l) => l.month === studentStatusMonth && scopedIds.has(l.studentId));
+              const paidCount = scopedLedger.filter((l) => Number(l.paidAmount || 0) > 0 || l.status === 'Paid').length;
+              const totalCount = scopedStudents.length;
+              const unpaidCount = Math.max(0, totalCount - paidCount);
+
+              return (
+                <>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="glass-card p-3"><div className="text-[10px] opacity-60">Assigned Students</div><div className="text-2xl font-black">{totalCount}</div></div>
+                    <div className="glass-card p-3"><div className="text-[10px] opacity-60">Paid ({studentStatusMonth})</div><div className="text-2xl font-black text-green-500">{paidCount}</div></div>
+                    <div className="glass-card p-3"><div className="text-[10px] opacity-60">Unpaid ({studentStatusMonth})</div><div className="text-2xl font-black text-amber-500">{unpaidCount}</div></div>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mt-4">
+                     {scopedStudents.map(e => {
+                       const monthLedger = monthlyFeeLedger.find((l) => l.studentId === e.id && l.month === studentStatusMonth);
+                       const isPaid = Boolean((monthLedger && Number(monthLedger.paidAmount || 0) > 0) || monthLedger?.status === 'Paid');
+                       const paidAmount = Number(monthLedger?.paidAmount || 0);
+                       return (
+                       <div key={e.id} className="glass-card p-4 flex items-center justify-between border-l-4 border-l-transparent" style={{ borderLeftColor: isPaid ? '#10b981' : '#ef4444' }}>
+                          <div className="flex items-center gap-3">
+                            <div className={`p-2 rounded-lg ${isPaid ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'}`}>
+                              {isPaid ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+                            </div>
+                            <div>
+                              <div className="text-sm font-bold">{e.name}</div>
+                              <div className="text-[10px] opacity-60">{e.batchName} • {e.subjects?.join(', ')}</div>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                             <span className={`text-[10px] font-black uppercase ${isPaid ? 'text-green-500' : 'text-red-500'}`}>
+                               {isPaid ? 'Paid' : 'Pending'}
+                             </span>
+                             <div className="text-[8px] opacity-40">{studentStatusMonth}</div>
+                             {isPaid && <div className="text-[10px] text-green-500 font-bold mt-1">₹{paidAmount}</div>}
+                             {!isPaid && (
+                               <div className="text-[10px] text-indigo-500 font-bold mt-1 cursor-pointer hover:underline" onClick={() => {
+                                 const msg = `Hi ${e.name},\nThis is a gentle reminder regarding your pending tuition fees. Please clear them.`;
+                                 window.open(`https://wa.me/${e.whatsapp?.replace(/\D/g, '')}?text=${encodeURIComponent(msg)}`);
+                               }}>Nudge</div>
+                             )}
+                          </div>
+                       </div>
+                     )})}
+                     {scopedStudents.length === 0 && <div className="p-10 text-center opacity-40 italic">No assigned students found.</div>}
+                  </div>
+                </>
+              );
+            })()}
+          </motion.div>
+        )}
+
+        {activeTab === 'admin-earnings' && isAdmin && (
+          <motion.div key="admin-earnings" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-4">
+            <div className="glass-card p-4 flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
+              <div>
+                <h3 className="font-bold">Admin Earnings Monitor</h3>
+                <p className="text-xs opacity-60">Select a faculty and review month-wise earning labels.</p>
+              </div>
+              <div className="flex gap-2">
+                <select
+                  value={adminSelectedFacultyId}
+                  onChange={(e) => setAdminSelectedFacultyId(e.target.value)}
+                  className="p-2 bg-white/5 border border-white/10 rounded-xl text-xs"
+                >
+                  <option value="">Select Faculty</option>
+                  {facultyList.map((f) => (
+                    <option key={f.id} value={f.id}>{f.name || f.email}</option>
+                  ))}
+                </select>
+                <select
+                  value={getMonthParts(selectedMonth).year}
+                  onChange={(e) => updateMonthValue(selectedMonth, Number(e.target.value), getMonthParts(selectedMonth).monthIndex)}
+                  className="p-2 bg-white/5 border border-white/10 rounded-xl text-xs"
+                >
+                  {yearOptions.map((y) => <option key={y} value={y}>{y}</option>)}
+                </select>
+                <select
+                  value={getMonthParts(selectedMonth).monthIndex}
+                  onChange={(e) => updateMonthValue(selectedMonth, getMonthParts(selectedMonth).year, Number(e.target.value))}
+                  className="p-2 bg-white/5 border border-white/10 rounded-xl text-xs"
+                >
+                  {monthNames.map((name, idx) => <option key={name} value={idx}>{name}</option>)}
+                </select>
+              </div>
+            </div>
+            {adminSelectedFacultyId && (() => {
+              const salaryInfo = facultySalaries.find((s) => s.userId === adminSelectedFacultyId);
+              const facultyMeta = facultyList.find((f) => f.id === adminSelectedFacultyId);
+              const attendanceModeEnabled = salaryInfo?.model === 'per_student' && (salaryInfo?.perStudentFormulaMode || 'paid_student') === 'attendance_adjusted';
+              const originalBreakdown = getMonthlySalaryBreakdown(salaryInfo, selectedMonth);
+              const breakdown = getMonthlySalaryBreakdown(salaryInfo, selectedMonth, adminAttendanceEditMode ? adminAttendanceEdit : undefined);
+              const alreadyDisbursed = payouts.filter((p) => p.userId === adminSelectedFacultyId && (p.periodMonth || selectedMonth) === selectedMonth)
+                .reduce((sum, p) => sum + Number(p.amount || 0), 0);
+              const netEarned = breakdown.earnedAmount;
+              const available = netEarned - alreadyDisbursed;
+              const monthAttendanceRows = getAttendanceRowsForFacultyMonth(adminSelectedFacultyId, selectedMonth);
+              return (
+                <div className="space-y-4">
+                  <div className="glass-card p-4">
+                    <div className="text-lg font-black">{facultyMeta?.name || facultyMeta?.email || 'Faculty'}</div>
+                    <div className="text-xs opacity-60">Salary dashboard for {monthNames[getMonthParts(selectedMonth).monthIndex]} {getMonthParts(selectedMonth).year}</div>
+                  </div>
+
+                  <div className="glass-card p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-xs font-black uppercase opacity-60">Attendance Summary (Admin Editable)</div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => {
+                            if (!adminAttendanceEditMode) {
+                              setAdminAttendanceEdit({
+                                totalClassDays: originalBreakdown.classDays,
+                                presentDays: originalBreakdown.presentDays,
+                                absentDays: originalBreakdown.absentDays
+                              });
+                            }
+                            setAdminAttendanceEditMode((v) => !v);
+                          }}
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold border ${adminAttendanceEditMode ? 'border-indigo-400/60 text-indigo-300 bg-indigo-500/10' : 'border-white/20 text-white/70 bg-white/5'}`}
+                        >
+                          <Edit2 size={12} className="inline mr-1" />
+                          {adminAttendanceEditMode ? 'Editing' : 'Edit'}
+                        </button>
+                        <button
+                          onClick={() => resetMonthlyAttendanceOverride(adminSelectedFacultyId, selectedMonth)}
+                          disabled={isResettingAttendance}
+                          className="px-2 py-1 rounded-md text-[10px] font-bold border border-emerald-400/40 text-emerald-300 bg-emerald-500/10 disabled:opacity-50"
+                        >
+                          {isResettingAttendance ? 'Resetting...' : 'Reset to Auto'}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <div>
+                        <label className="text-[10px] opacity-60">Total Class Days</label>
+                        <input type="number" min={0} disabled={!adminAttendanceEditMode} value={adminAttendanceEdit.totalClassDays} onChange={(e) => setAdminAttendanceEdit(v => ({ ...v, totalClassDays: Number(e.target.value || 0), absentDays: Math.max(0, Number(e.target.value || 0) - v.presentDays) }))} className="mt-1 w-full p-2 bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-lg text-sm font-bold disabled:opacity-60 text-gray-900 dark:text-white" />
+                      </div>
+                      <div>
+                        <label className="text-[10px] opacity-60">Present Days</label>
+                        <input type="number" min={0} disabled={!adminAttendanceEditMode} value={adminAttendanceEdit.presentDays} onChange={(e) => setAdminAttendanceEdit(v => ({ ...v, presentDays: Number(e.target.value || 0), absentDays: Math.max(0, v.totalClassDays - Number(e.target.value || 0)) }))} className="mt-1 w-full p-2 bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-lg text-sm font-bold disabled:opacity-60 text-gray-900 dark:text-white" />
+                      </div>
+                      <div>
+                        <label className="text-[10px] opacity-60">Absent Days</label>
+                        <input type="number" min={0} disabled={!adminAttendanceEditMode} value={adminAttendanceEdit.absentDays} onChange={(e) => setAdminAttendanceEdit(v => ({ ...v, absentDays: Number(e.target.value || 0) }))} className="mt-1 w-full p-2 bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-lg text-sm font-bold disabled:opacity-60 text-gray-900 dark:text-white" />
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button disabled={!adminAttendanceEditMode} onClick={() => saveMonthlyAttendanceOverride(adminSelectedFacultyId, selectedMonth, adminAttendanceEdit, { totalClassDays: originalBreakdown.classDays, presentDays: originalBreakdown.presentDays, absentDays: originalBreakdown.absentDays })} className="px-3 py-2 bg-[var(--primary)] text-white rounded-lg text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed">Save Attendance Edits</button>
+                      <button onClick={() => setAttendanceModal({ open: true, facultyId: adminSelectedFacultyId, facultyName: facultyMeta?.name || facultyMeta?.email || 'Faculty', month: selectedMonth })} className="px-3 py-2 bg-white/10 rounded-lg text-xs font-bold">View Attendance Table ({monthAttendanceRows.length})</button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 border-t border-white/10 pt-6">
+                    <h4 className="font-bold mb-4">Faculty Earnings Dashboard</h4>
+                    <div className="space-y-6">
+                      <div className="glass-card p-6 bg-indigo-500/10 border-indigo-500/20 max-w-3xl relative overflow-hidden">
+                          <div className="flex justify-between items-start relative z-10">
+                               <div>
+                                  <div className="flex items-center gap-2 text-xs uppercase font-black opacity-80 mb-1 tracking-widest text-indigo-400">
+                                     <TrendingUp size={16} /> Max Potential
+                                  </div>
+                                  <div className="text-5xl font-black text-green-400 flex items-baseline gap-1 mt-2">
+                                    ₹{Math.round(breakdown.fullPotentialAmount).toLocaleString()}
+                                  </div>
+                                  <div className="text-xs opacity-60 mt-2 font-bold uppercase tracking-widest text-indigo-400">Total possible earnings this month</div>
+                               </div>
+                          </div>
+                          
+                          <div className="absolute top-4 right-4 text-indigo-500/20 z-0">
+                              <TrendingUp size={100} strokeWidth={1.5} />
+                          </div>
+                          
+                          <div className="mt-8 grid grid-cols-2 gap-4 bg-black/20 rounded-2xl p-4 border border-white/5 relative z-10">
+                              <div>
+                                  <div className="flex items-center gap-2 mb-1">
+                                       <div className="w-2 h-2 rounded-full bg-green-500"></div>
+                                       <span className="text-xs font-bold text-white leading-tight">Real-Time Earned</span>
+                                  </div>
+                                  <div className="text-2xl font-black text-green-400">₹{Math.round(breakdown.realTimeEarnedAmount).toLocaleString()}</div>
+                                  <div className="text-[10px] text-gray-400 mt-1 leading-tight">From paid students &<br/>attendance</div>
+                              </div>
+                              <div>
+                                  <div className="flex items-center gap-2 mb-1">
+                                       <div className="w-2 h-2 rounded-full bg-amber-500"></div>
+                                       <span className="text-xs font-bold text-white leading-tight">Salary Paid</span>
+                                  </div>
+                                  <div className="text-2xl font-black text-amber-400">₹{Math.round(alreadyDisbursed).toLocaleString()}</div>
+                                  <div className="text-[10px] text-gray-400 mt-1 leading-tight">Total amount<br/>disbursed</div>
+                              </div>
+                          </div>
+                      </div>
+
+                      <div className="glass-card p-6 bg-white/5 border-white/10 flex items-center justify-between max-w-3xl relative overflow-hidden">
+                          <div className="relative z-10">
+                              <div className="flex items-center gap-2 text-xs uppercase font-black opacity-60 mb-1 tracking-widest text-indigo-400">
+                                  <div className="w-6 h-6 rounded-full bg-indigo-500/20 flex items-center justify-center"><IndianRupee size={12} className="text-indigo-400" /></div>
+                                  Balance Salary
+                              </div>
+                              <div className={`text-3xl font-black mt-2 ${available < 0 ? 'text-amber-400' : 'text-indigo-400'}`}>
+                                  ₹{Math.round(Math.abs(available)).toLocaleString()} {available < 0 ? '(Advance)' : ''}
+                              </div>
+                              <div className="text-xs opacity-50 mt-1 uppercase tracking-widest font-bold">Real-Time Earned - Salary Paid</div>
+                          </div>
+                          <div className="absolute right-6 top-1/2 -translate-y-1/2 text-white/5">
+                             <div className="w-16 h-16 rounded-3xl bg-indigo-500/10 flex items-center justify-center rotate-12">
+                                 <IndianRupee size={32} />
+                             </div>
+                          </div>
+                      </div>
+
+                      <div className="glass-card p-6 bg-white/5 border-white/10 max-w-3xl">
+                          <div className="text-xs uppercase font-black opacity-60 mb-6 tracking-widest">Earning Progress</div>
+                          
+                          <div className="flex items-center justify-between mb-2">
+                              <div>
+                                 <div className="text-[10px] text-gray-400 font-bold mb-1">Max Potential</div>
+                                 <div className="text-xl md:text-2xl font-black text-purple-400">₹{Math.round(breakdown.fullPotentialAmount).toLocaleString()}</div>
+                                 <div className="text-[10px] text-gray-500 mt-1 leading-tight hidden md:block">If all students pay &<br/>full attendance</div>
+                              </div>
+                              <div className="flex flex-col items-center mx-1 md:mx-2">
+                                 <div className="w-14 h-14 md:w-16 md:h-16 rounded-full border-4 border-indigo-500/20 flex items-center justify-center relative shadow-[0_0_15px_rgba(99,102,241,0.2)] bg-[#1e1e1e]">
+                                      <span className="text-xs md:text-sm font-black">{Math.round((breakdown.realTimeEarnedAmount / Math.max(1, breakdown.fullPotentialAmount)) * 100)}%</span>
+                                 </div>
+                                 <div className="text-[10px] text-gray-400 mt-2 text-center leading-tight">Progress to<br/>Max Potential</div>
+                              </div>
+                              <div className="text-right">
+                                 <div className="text-[10px] text-gray-400 font-bold mb-1">Unlockable</div>
+                                 <div className="text-xl md:text-2xl font-black text-amber-400">₹{Math.round(breakdown.pendingPotentialAmount).toLocaleString()}</div>
+                                 <div className="text-[10px] text-gray-500 mt-1 leading-tight hidden md:block">Keep going! Can<br/>still earn more</div>
+                              </div>
+                          </div>
+                          
+                          <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden mt-6 relative">
+                               <motion.div initial={{ width: 0 }} animate={{ width: `${Math.round((breakdown.realTimeEarnedAmount / Math.max(1, breakdown.fullPotentialAmount)) * 100)}%` }} className="absolute top-0 bottom-0 left-0 bg-indigo-500 rounded-full"></motion.div>
+                          </div>
+                          <div className="text-[10px] text-indigo-400 mt-2 font-bold tracking-widest uppercase">₹{Math.round(breakdown.realTimeEarnedAmount).toLocaleString()} earned of ₹{Math.round(breakdown.fullPotentialAmount).toLocaleString()} max potential</div>
+                      </div>
+
+                      <div className="glass-card p-6 bg-white/5 border-white/10 max-w-3xl">
+                          <div className="flex items-center gap-2 text-xs uppercase font-black opacity-60 mb-4 tracking-widest">
+                               <Users size={16} /> Student Fee Summary
+                          </div>
+                          <div className="grid grid-cols-2 gap-4">
+                               <div className="bg-black/20 rounded-xl p-4 flex flex-col md:flex-row md:items-center gap-3 border border-green-500/20">
+                                   <div className="w-10 h-10 rounded-full bg-green-500/20 flex items-center justify-center text-green-500 shrink-0"><CheckCircle2 size={20} /></div>
+                                   <div>
+                                       <div className="text-[10px] text-gray-400 font-bold leading-tight uppercase">Paid<br/>({selectedMonth})</div>
+                                       <div className="text-2xl font-black text-green-400 mt-1">{breakdown.paidStudentsCount}</div>
+                                   </div>
+                               </div>
+                               
+                               <div className="bg-black/20 rounded-xl p-4 flex flex-col md:flex-row md:items-center gap-3 border border-amber-500/20 relative">
+                                   <div className="w-10 h-10 rounded-full bg-amber-500/20 flex items-center justify-center text-amber-500 shrink-0"><AlertCircle size={20} /></div>
+                                   <div>
+                                       <div className="text-[10px] text-gray-400 font-bold leading-tight uppercase">Unpaid<br/>({selectedMonth})</div>
+                                       <div className="text-2xl font-black text-amber-400 mt-1">{breakdown.unpaidStudentsCount}</div>
+                                   </div>
+                               </div>
+                          </div>
+                          <div className="mt-4 p-3 bg-white/5 rounded-lg border border-white/5 flex gap-2 items-center">
+                               <Users size={14} className="opacity-40" />
+                               <span className="text-xs opacity-60">Total Assigned Students:</span>
+                               <span className="text-xs font-bold">{breakdown.totalAssignedStudents}</span>
+                          </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {attendanceModal.open && (
+          <div className="fixed inset-0 z-[2200] flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setAttendanceModal({ open: false, facultyId: '', facultyName: '', month: '' })} />
+            <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="relative w-full max-w-6xl bg-[#171717] border border-white/10 rounded-2xl p-5">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-lg font-black">Attendance Details</h4>
+                  <p className="text-xs opacity-60">{attendanceModal.facultyName} • {attendanceModal.month}</p>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => exportAttendancePdf(attendanceModalRows, attendanceModal.facultyName, attendanceModal.month)} className="px-3 py-2 rounded-lg bg-red-500/20 text-red-300 text-xs font-bold flex items-center gap-1"><Download size={14} /> Download PDF</button>
+                  <button onClick={() => exportAttendanceXlsx(attendanceModalRows, attendanceModal.facultyName, attendanceModal.month)} className="px-3 py-2 rounded-lg bg-emerald-500/20 text-emerald-300 text-xs font-bold flex items-center gap-1"><Download size={14} /> Download Excel</button>
+                </div>
+              </div>
+              <div className="mt-4 max-h-[60vh] overflow-auto border border-white/10 rounded-xl">
+                <table className="w-full text-left text-xs">
+                  <thead className="sticky top-0 bg-black/70 backdrop-blur text-[10px] uppercase opacity-70">
+                    <tr>
+                      <th className="p-3">Date</th>
+                      <th className="p-3">Subject</th>
+                      <th className="p-3">Batch</th>
+                      <th className="p-3">Status</th>
+                      <th className="p-3">Marked By</th>
+                      <th className="p-3">Timestamp</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/5">
+                    {attendanceModalRows.map((row: any) => {
+                      const n = normalizeAttendanceRow(row);
+                      return (
+                      <tr key={row.id || `${n.date}-${n.subject}-${n.batch}`}>
+                        <td className="p-3">{n.date}</td>
+                        <td className="p-3">{n.subject}</td>
+                        <td className="p-3">{n.batch}</td>
+                        <td className="p-3">{n.status}</td>
+                        <td className="p-3">{n.markedBy}</td>
+                        <td className="p-3">{n.timestamp}</td>
+                      </tr>
+                    )})}
+                    {attendanceModalRows.length === 0 && (
+                      <tr><td colSpan={6} className="p-5 text-center opacity-50">No attendance data for this period.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Requests Tab */}
+      <AnimatePresence mode="wait">
+        {(activeTab as any) === 'requests' && isAdmin && (
+          <motion.div key="requests" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-6">
+            <h3 className="font-bold text-lg mb-4 text-amber-500 flex items-center gap-2">
+              <AlertCircle size={20} /> Action Required
+            </h3>
+            
+            <div className="space-y-4">
+              {/* Resignation Requests */}
+              {resignations.length > 0 && (
+                <div className="space-y-4">
+                  <div className="text-[10px] font-black uppercase opacity-40 ml-1">Resignations ({resignations.length})</div>
+                  {resignations.map(req => (
+                    <div key={req.id} className="glass-card p-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-l-4 border-red-500">
+                      <div>
+                        <h4 className="font-bold">{req.userName} <span className={`text-[10px] px-2 py-0.5 rounded ml-2 uppercase tracking-widest ${req.status === 'approved' ? 'bg-green-500/10 text-green-500' : req.status === 'rejected' ? 'bg-red-500/10 text-red-500' : 'bg-amber-500/10 text-amber-500'}`}>{req.status}</span></h4>
+                        <p className="text-xs opacity-60 mt-1">LWD: {req.resignationDate}</p>
+                        {req.letterUrl && (
+                           <a href={req.letterUrl} target="_blank" rel="noopener noreferrer" className="text-[10px] text-blue-400 hover:underline mt-2 inline-flex items-center gap-1">
+                             <FileText size={10} /> View Resignation Letter
+                           </a>
+                        )}
+                      </div>
+                      <div className="flex gap-2">
+                         <button onClick={() => firestoreService.updateItem('resignations', req.id, { status: 'approved' })} className="px-4 py-2 bg-green-500 text-white rounded-lg text-xs font-bold transition-colors">Accept</button>
+                         <button onClick={() => firestoreService.updateItem('resignations', req.id, { status: 'rejected' })} className="px-4 py-2 bg-red-500 text-white rounded-lg text-xs font-bold transition-colors">Reject</button>
+                         <button onClick={() => { if(window.confirm('Delete this request?')) firestoreService.deleteItem('resignations', req.id); }} className="px-4 py-2 border border-red-500/50 text-red-500 hover:bg-red-500 hover:text-white rounded-lg text-xs font-bold transition-colors">Delete</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Payout Requests */}
+              {requests.filter(r => r.status === 'pending').length > 0 && (
+                <div className="space-y-4">
+                  <div className="text-[10px] font-black uppercase opacity-40 ml-1">Disbursement Requests ({requests.filter(r => r.status === 'pending').length})</div>
+                  {requests.filter(r => r.status === 'pending').map(req => (
+                    <div key={req.id} className="glass-card p-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-l-4 border-indigo-500">
+                      <div>
+                        <h4 className="font-bold">{req.userName}</h4>
+                        <p className="text-xs font-black text-indigo-500">Requesting ₹{req.amount.toLocaleString()}</p>
+                        <p className="text-[10px] opacity-40 mt-1">Submitted: {req.createdAt?.toDate().toLocaleString()}</p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button 
+                          onClick={() => {
+                            const tid = prompt('Enter Transaction ID for Payout:');
+                            if (!tid) return;
+                            const amountInput = prompt('Enter amount to disburse (partial allowed):', String(req.amount || 0));
+                            const amount = Number(amountInput || 0);
+                            if (!amount || amount <= 0) return;
+                            const note = prompt('Optional note for disbursement log:', 'Processed from disbursement request') || '';
+                            recordPayout({
+                              userId: req.userId,
+                              userName: req.userName,
+                              amount,
+                              transactionId: tid,
+                              note,
+                              periodMonth: selectedMonth,
+                              method: 'manual',
+                              approvedBy: user.email
+                            });
+                            firestoreService.updateItem('payout_requests', req.id, {
+                              status: amount === Number(req.amount || 0) ? 'processed' : 'partially_processed',
+                              transactionId: tid,
+                              processedAmount: amount,
+                              approvedBy: user.email,
+                              processedAt: serverTimestamp(),
+                            });
+                          }} 
+                          className="px-4 py-2 bg-indigo-500 text-white rounded-lg text-xs font-bold transition-colors"
+                        >
+                          Confirm & Pay
+                        </button>
+                        <button onClick={() => firestoreService.updateItem('payout_requests', req.id, { status: 'rejected' })} className="px-4 py-2 bg-white/5 text-red-500 rounded-lg text-xs font-bold transition-colors">Reject</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {resignations.length === 0 && requests.filter(r => r.status === 'pending').length === 0 && (
+                <div className="p-8 text-center text-sm opacity-50 italic border border-dashed border-white/10 rounded-2xl">
+                  Clean slate! No pending requests.
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Add Payout Modal */}
+      <AnimatePresence>
+        {isAddingPayout && isAdmin && (
+          <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setIsAddingPayout(false)} />
+            <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="relative w-full max-w-md bg-white dark:bg-[#1e1e1e] rounded-3xl p-8 space-y-6">
+              <h3 className="text-xl font-black italic">RECORD MANUAL PAYOUT</h3>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase opacity-40">Select Faculty</label>
+                  <select
+                    className="w-full p-3 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-xl text-sm"
+                    value={payoutForm.userId}
+                    onChange={e => setPayoutForm({...payoutForm, userId: e.target.value})}
+                  >
+                    <option value="">Select Faculty...</option>
+                    {facultyList.map(f => (
+                      <option key={f.id} value={f.id}>{f.name || f.email}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase opacity-40">Amount (₹)</label>
+                  <input
+                    type="number"
+                    className="w-full p-3 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-xl text-sm outline-none focus:border-[var(--primary)]"
+                    value={payoutForm.amount}
+                    onChange={e => setPayoutForm({...payoutForm, amount: e.target.value})}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase opacity-40">Transaction ID</label>
+                  <input
+                    type="text"
+                    className="w-full p-3 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-xl text-sm outline-none focus:border-[var(--primary)]"
+                    value={payoutForm.transactionId}
+                    onChange={e => setPayoutForm({...payoutForm, transactionId: e.target.value})}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase opacity-40">Method</label>
+                  <select
+                    className="w-full p-3 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-xl text-sm"
+                    value={payoutForm.method}
+                    onChange={e => setPayoutForm({...payoutForm, method: e.target.value})}
+                  >
+                    <option value="upi">UPI</option>
+                    <option value="bank">Bank Transfer</option>
+                    <option value="cash">Cash</option>
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase opacity-40">Period Month</label>
+                  <input
+                    type="month"
+                    className="w-full p-3 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-xl text-sm outline-none focus:border-[var(--primary)]"
+                    value={payoutForm.periodMonth}
+                    onChange={e => setPayoutForm({...payoutForm, periodMonth: e.target.value})}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase opacity-40">Note</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Cleared pending dues"
+                    className="w-full p-3 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-xl text-sm outline-none focus:border-[var(--primary)]"
+                    value={payoutForm.note}
+                    onChange={e => setPayoutForm({...payoutForm, note: e.target.value})}
+                  />
+                </div>
+              </div>
+              <button 
+                onClick={() => {
+                  const targetFaculty = facultyList.find(f => f.id === payoutForm.userId);
+                  if (targetFaculty && payoutForm.amount) {
+                    recordPayout({
+                      userId: targetFaculty.id,
+                      userName: targetFaculty.name || targetFaculty.email,
+                      amount: Number(payoutForm.amount),
+                      transactionId: payoutForm.transactionId,
+                      note: payoutForm.note,
+                      method: payoutForm.method,
+                      periodMonth: payoutForm.periodMonth,
+                      approvedBy: user.email
+                    });
+                    setIsAddingPayout(false);
+                    setPayoutForm({ userId: '', amount: '', transactionId: '', note: '', method: 'upi', periodMonth: new Date().toISOString().slice(0, 7) });
+                  } else {
+                    toast.error('Select faculty and enter amount');
+                  }
+                }}
+                className="w-full py-4 bg-[var(--primary)] text-white rounded-2xl font-black uppercase tracking-widest hover:opacity-90"
+              >
+                Save Payout Record
+              </button>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Resignation Modal */}
+      <AnimatePresence>
+        {isResigning && (
+          <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4">
+             <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => !resignationFileUploading && setIsResigning(false)} />
+             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="relative w-full max-w-md bg-white dark:bg-[#1e1e1e] rounded-3xl p-8 space-y-6">
+                {isResignationSubmitted ? (
+                  <div className="flex flex-col items-center justify-center space-y-4 py-8 text-center">
+                    <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} className="w-20 h-20 bg-green-500/20 text-green-500 rounded-full flex items-center justify-center mb-4">
+                      <CheckCircle2 size={40} />
+                    </motion.div>
+                    <h3 className="text-2xl font-black italic text-green-500">SUBMITTED!</h3>
+                    <p className="text-sm opacity-70">Your resignation request and letter have been successfully securely submitted to the administration.</p>
+                  </div>
+                ) : (
+                  <>
+                    <h3 className="text-2xl font-black italic">SUBMIT RESIGNATION</h3>
+                    <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl text-xs space-y-2 text-amber-500">
+                       <p className="font-bold flex items-center gap-2"><AlertCircle size={14}/> Notice Period Policy</p>
+                       <p className="opacity-80">Employees must provide a 15-day notice period. A full calendar month notice is mandate to complete full calendar month.</p>
+                    </div>
+                    <div className="space-y-2">
+                       <label className="text-[10px] font-black uppercase opacity-40">Proposed Last Working Day</label>
+                       <input 
+                        type="date" 
+                        value={resignationDate}
+                        onChange={(e) => setResignationDate(e.target.value)}
+                        disabled={resignationFileUploading}
+                        className="w-full p-4 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-2xl outline-none disabled:opacity-50"
+                       />
+                    </div>
+                    <div className="space-y-2">
+                       <label className="text-[10px] font-black uppercase opacity-40">Resignation Letter (PDF/Doc)</label>
+                       <div className="relative">
+                         <input 
+                          type="file" 
+                          onChange={(e) => setResignationFile(e.target.files ? e.target.files[0] : null)}
+                          disabled={resignationFileUploading}
+                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
+                          accept=".pdf,.doc,.docx,image/*"
+                         />
+                         <div className={`w-full p-4 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center gap-2 border-dashed ${resignationFileUploading ? 'opacity-50' : 'hover:border-[var(--primary)] transition-colors'}`}>
+                           <FileText size={18} className={resignationFile ? 'text-[var(--primary)]' : 'opacity-40'} />
+                           <span className={`text-sm font-bold truncate max-w-[200px] ${resignationFile ? 'text-[var(--primary)]' : 'opacity-70'}`}>
+                             {resignationFile ? resignationFile.name : 'Click or Drag Document Here'}
+                           </span>
+                         </div>
+                       </div>
+                       {resignationFileUploading && (
+                         <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden mt-2">
+                           <div className="h-full bg-[var(--primary)] transition-all duration-300 relative" style={{ width: `${resignationFileProgress}%` }}>
+                             <div className="absolute inset-0 bg-white/20 animate-pulse" />
+                           </div>
+                         </div>
+                       )}
+                       {resignationFileUploading && (
+                         <div className="text-[10px] text-center mt-1 font-bold text-[var(--primary)] uppercase tracking-widest animate-pulse">
+                           Uploading... {Math.round(resignationFileProgress)}%
+                         </div>
+                       )}
+                    </div>
+                    <button 
+                      onClick={handleResignation}
+                      disabled={resignationFileUploading}
+                      className="w-full py-4 bg-red-500 text-white rounded-2xl font-black uppercase tracking-widest disabled:opacity-50 transition-all hover:scale-[1.02] active:scale-95"
+                    >
+                      {resignationFileUploading ? 'Processing...' : 'Confirm Submission'}
+                    </button>
+                  </>
+                )}
+             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Editor Modal for Payment Info */}
+      <AnimatePresence>
+        {isEditingPayment && (
+          <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4">
+             <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setIsEditingPayment(false)} />
+             <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="relative w-full max-w-sm bg-white dark:bg-[#1e1e1e] rounded-3xl p-8 space-y-6">
+                <h3 className="text-xl font-black italic flex items-center gap-2"><CreditCard /> PAYMENT INFO</h3>
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                     <label className="text-[10px] font-black uppercase opacity-40">UPI ID</label>
+                     <input 
+                      type="text" 
+                      value={paymentUpi}
+                      onChange={(e) => setPaymentUpi(e.target.value)}
+                      placeholder="e.g. name@okhdfcbank"
+                      className="w-full p-4 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-2xl outline-none text-sm"
+                     />
+                  </div>
+                  <div className="space-y-2">
+                     <label className="text-[10px] font-black uppercase opacity-40">Bank Details (Optional)</label>
+                     <textarea 
+                      value={paymentBank}
+                      onChange={(e) => setPaymentBank(e.target.value)}
+                      placeholder="Account No / IFSC"
+                      rows={3}
+                      className="w-full p-4 bg-gray-100 dark:bg-white/5 border border-white/10 rounded-2xl outline-none text-sm resize-none"
+                     />
+                  </div>
+                  <button 
+                    onClick={() => {
+                      saveSalarySettings(user.uid, { paymentMethod: { upiId: paymentUpi, bankDetails: paymentBank } });
+                      setIsEditingPayment(false);
+                    }}
+                    className="w-full py-4 bg-indigo-500 text-white rounded-2xl font-black uppercase tracking-widest hover:scale-105 transition-all shadow-lg"
+                  >
+                    Save Details
+                  </button>
+                </div>
+             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Spotify Wrapped Style Card */}
+      <AnimatePresence>
+        {showWrapped && (
+          <div className="fixed inset-0 z-[3000] flex items-center justify-center p-4">
+             <div className="absolute inset-0 bg-black/90 backdrop-blur-md" onClick={() => setShowWrapped(false)} />
+             <motion.div initial={{ opacity: 0, y: 50, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} className="relative w-full max-w-sm flex flex-col items-center gap-6">
+                {/* Wrapped Card that gets exported */}
+                <div id="faculty-wrapped-card" className="w-[320px] aspect-[9/16] bg-[#0c0c0e] rounded-[2.5rem] p-10 flex flex-col justify-between overflow-hidden relative shadow-2xl border border-white/5">
+                  {/* Decorative Elements */}
+                  <div className="absolute top-[-10%] right-[-10%] w-60 h-60 bg-[var(--primary)]/20 blur-[80px] rounded-full" />
+                  <div className="absolute bottom-[-10%] left-[-10%] w-60 h-60 bg-indigo-500/20 blur-[80px] rounded-full" />
+                  
+                  <div className="relative z-10 w-full flex items-center justify-between">
+                    <img src="/logo.png" alt="Logo" className="h-6 object-contain opacity-50" onError={(e) => (e.currentTarget.style.display = 'none')} />
+                    <span className="text-white/40 font-black text-[10px] tracking-[0.2em] uppercase">Faculty Wrapped</span>
+                  </div>
+
+                  <div className="relative z-10 space-y-6">
+                    <div>
+                      <h2 className="text-2xl font-black text-white italic leading-tight tracking-tighter uppercase">
+                        ADVANCED<br/>CLASSES,<br/><span className="text-[var(--primary)]">SONAI</span>
+                      </h2>
+                      <div className="h-1 w-12 bg-[var(--primary)] mt-3" />
+                    </div>
+
+                    <div className="space-y-1">
+                      <h3 className="text-xl font-bold text-white">{user?.displayName}</h3>
+                      <p className="text-[10px] font-black text-[var(--primary)] uppercase tracking-widest opacity-80">
+                         Faculty of {facultyManagedBatches[0]?.batchName || 'General'} & {facultyManagedBatches.map(b => b.subject).join(', ')}
+                      </p>
+                    </div>
+
+                    {(() => {
+                      const facultyAssignedBatches = facultyBatches.filter(fb => fb.userId === user.uid);
+                      const monthLogs = attendance.filter(a => a.userId === user.uid && (a.dateStr || '').startsWith(selectedMonth));
+                      const presentDays = monthLogs.filter(a => a.status === 'present').length;
+                      const attendanceRate = monthLogs.length > 0 ? Math.round((presentDays / monthLogs.length) * 100) : 100;
+
+                      return (
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="bg-white/5 p-4 rounded-2xl border border-white/5 backdrop-blur-sm">
+                            <span className="text-white/40 text-[8px] font-black uppercase tracking-wider block mb-1">Impact</span>
+                            <span className="text-white text-xl font-black">
+                               {enrollments.filter(e => facultyAssignedBatches.some(fb => fb.batchId === e.batchId)).length}
+                            </span>
+                            <span className="text-[8px] block opacity-40">Students</span>
+                          </div>
+                          
+                          <div className="bg-white/5 p-4 rounded-2xl border border-white/5 backdrop-blur-sm">
+                            <span className="text-white/40 text-[8px] font-black uppercase tracking-wider block mb-1">Score</span>
+                            <span className="text-white text-xl font-black">{attendanceRate}%</span>
+                            <span className="text-[8px] block opacity-40">Reliability</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  <div className="relative z-10 w-full space-y-4">
+                    <div className="p-6 bg-gradient-to-br from-[var(--primary)] to-indigo-600 rounded-3xl text-white shadow-xl">
+                       <span className="text-[8px] font-black uppercase tracking-widest opacity-70 block mb-1">Total Payout Pending</span>
+                      <div className="text-3xl font-black">₹{Number(displayBalance || 0).toLocaleString()}</div>
+                       <div className="text-[8px] opacity-60 font-bold mt-1 uppercase tracking-tighter italic">— Secure Digital Split —</div>
+                    </div>
+                    <p className="text-[8px] text-white/30 text-center font-bold tracking-widest uppercase italic">Xavi x Sonai Internal Platform</p>
+                  </div>
+                </div>
+
+                {/* Download Button */}
+                <button 
+                  onClick={handleShareWrapped}
+                  className="w-[320px] py-4 bg-white text-black rounded-full font-black uppercase tracking-widest hover:scale-105 transition-all shadow-[0_0_40px_rgba(255,255,255,0.3)] flex items-center justify-center gap-2"
+                >
+                  <Download size={18} /> Share My Flex
+                </button>
+             </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

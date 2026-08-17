@@ -1,0 +1,9 @@
+{
+  "name": "Advanced Classes v13.6",
+  "description": "A sophisticated study hub for Advanced Classes Sonai, featuring real-time collaborative chat, resource management, and automated enrollment tracking.",
+  "Overwrite": true,
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
